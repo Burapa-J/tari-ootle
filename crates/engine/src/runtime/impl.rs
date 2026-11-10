@@ -428,18 +428,9 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         Ok(loaded.shared_template_def())
     }
 
-    fn validate_return_value(&self, value: &IndexedValue) -> Result<(), RuntimeError> {
+    fn validate_workspace_value(&self, value: &IndexedValue) -> Result<(), RuntimeError> {
         self.tracker.read_with(|state| {
-            for bucket_id in value.bucket_ids() {
-                let _ignore = state.get_bucket(*bucket_id)?;
-            }
-
-            // `get_bucket` scope-checks; `get_proof` does not, so the frame's own scope is checked here to keep a
-            // returned proof to the same rule as a returned bucket: only a held proof crosses to the caller.
-            for proof_id in value.proof_ids() {
-                state.current_call_scope()?.require_held_proof(proof_id)?;
-                let _ignore = state.get_proof(*proof_id)?;
-            }
+            state.check_capabilities_held(value.well_known_types())?;
 
             for id in value.referenced_substates() {
                 if !state.substate_exists(&id)? {
@@ -3638,7 +3629,7 @@ where
                     .take_last_instruction_output()
                     .ok_or(RuntimeError::NoLastInstructionOutput)?;
 
-                self.validate_return_value(&last_output)?;
+                self.validate_workspace_value(&last_output)?;
 
                 self.tracker
                     .with_workspace_mut(|workspace| workspace.insert(key, last_output))?;
@@ -4020,10 +4011,6 @@ where
                         .map(|public_key| id_provider.derive_new_component_address(&template, public_key))
                         .unwrap_or_else(|| id_provider.new_component_address())?;
 
-                    if state.substate_exists(&SubstateId::Component(address))? {
-                        return Err(RuntimeError::ComponentAlreadyExists { address });
-                    }
-
                     let id = state.new_address_allocation(address)?;
                     Ok(InvokeResult::encode(&ComponentAddressAllocation::new(id))?)
                 },
@@ -4249,7 +4236,7 @@ where
     fn put_on_workspace(&self, id: WorkspaceId, value: IndexedValue) -> Result<(), RuntimeError> {
         self.invoke_modules_on_runtime_call("put_on_workspace")?;
 
-        self.validate_return_value(&value)?;
+        self.validate_workspace_value(&value)?;
 
         self.tracker
             .with_workspace_mut(|workspace| workspace.insert(id, value))?;
@@ -5309,5 +5296,91 @@ mod tests {
             })
             .unwrap();
         runtime.pop_call_frame(&IndexedWellKnownTypes::new()).unwrap();
+    }
+
+    #[test]
+    fn resource_create_rejects_address_allocation_from_different_template_without_consuming_it() {
+        let runtime = runtime_with_blobs(Blobs::default());
+        let template_a = TemplateAddress::from_array([1u8; 32]);
+        let template_b = TemplateAddress::from_array([2u8; 32]);
+        let entity_id = EntityId::new([1u8; EntityId::LENGTH]);
+
+        runtime
+            .push_call_frame(
+                PushCallFrame::Static {
+                    template_address: template_a,
+                    module_name: "TemplateA".to_string(),
+                    arg_scope: IndexedWellKnownTypes::new(),
+                    entity_id,
+                },
+                None,
+            )
+            .unwrap();
+
+        let alloc: ResourceAddressAllocation = runtime
+            .allocate_address_invoke(AddressAllocationInvokeArg::CreateResourceAllocation)
+            .unwrap()
+            .decode()
+            .unwrap();
+        let alloc_id = alloc.id();
+
+        let arg_scope = IndexedWellKnownTypes::from_value(&tari_bor::to_value(&alloc).unwrap()).unwrap();
+        runtime
+            .push_call_frame(
+                PushCallFrame::Static {
+                    template_address: template_b,
+                    module_name: "TemplateB".to_string(),
+                    arg_scope,
+                    entity_id,
+                },
+                None,
+            )
+            .unwrap();
+
+        let create_arg = CreateResourceArg {
+            resource_type: ResourceType::Fungible,
+            owner_rule: OwnerRule::None,
+            access_rules: tari_template_lib::types::access_rules::ResourceAccessRules::new(),
+            metadata: Metadata::new(),
+            mint_arg: Some(MintArg::Fungible { amount: 100u64.into() }),
+            view_key: None,
+            authorize_hook: None,
+            address_allocation: Some(alloc.clone()),
+            divisibility: 0,
+            is_total_supply_tracking_enabled: true,
+        };
+        let err = runtime
+            .resource_invoke(
+                ResourceRef::Resource,
+                ResourceAction::Create,
+                EngineArgs::from(vec![tari_bor::encode(&create_arg).unwrap().into()]),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeError::AddressAllocationTemplateMismatch {
+                id,
+                allocated_by,
+                used_by,
+            } if id == alloc_id && allocated_by == template_a && used_by == template_b
+        ));
+
+        runtime.pop_call_frame(&IndexedWellKnownTypes::new()).unwrap();
+
+        let created = runtime
+            .resource_invoke(
+                ResourceRef::Resource,
+                ResourceAction::Create,
+                EngineArgs::from(vec![tari_bor::encode(&create_arg).unwrap().into()]),
+            )
+            .unwrap();
+        let (resource_address, bucket): (ResourceAddress, Option<tari_template_lib::models::Bucket>) =
+            created.decode().unwrap();
+        assert!(bucket.is_some());
+        runtime
+            .pop_call_frame(
+                &IndexedWellKnownTypes::from_value(&tari_bor::to_value(&(resource_address, bucket)).unwrap()).unwrap(),
+            )
+            .unwrap();
     }
 }

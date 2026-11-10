@@ -172,10 +172,9 @@ pub(super) struct WorkingState<TStore> {
     events: Vec<Event>,
     logs: Vec<LogEntry>,
     buckets: HashMap<BucketId, Bucket>,
-    /// `get_allocated_address_by_address` scans these, and two allocations can name the same address, so the
-    /// iteration order decides which one a lookup finds. It must therefore follow from the transaction's own
-    /// operations rather than from a hash seed.
+    /// Pending address allocations keyed by allocation id, with a reverse index by [`SubstateId`] for O(1) lookup.
     address_allocations: IndexMap<AddressAllocationId, AllocatedAddress>,
+    allocated_addresses_by_substate: HashMap<SubstateId, AddressAllocationId>,
     /// Only ever inserted into and looked up by id. Ordered for symmetry with `address_allocations`.
     used_address_allocations: IndexMap<AddressAllocationId, SubstateId>,
     address_allocation_id: u32,
@@ -233,6 +232,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
             proofs: HashMap::new(),
             address_allocation_id: 0,
             address_allocations: IndexMap::new(),
+            allocated_addresses_by_substate: HashMap::new(),
             used_address_allocations: IndexMap::new(),
 
             store: WorkingStateStore::new(state_store, read_declared_inputs),
@@ -1341,6 +1341,13 @@ impl<TStore: StateReader> WorkingState<TStore> {
         address: T,
     ) -> Result<AddressAllocationId, RuntimeError> {
         self.check_create_allowed("new_address_allocation")?;
+        let substate_id: SubstateId = address.into();
+        if self.substate_exists(&substate_id)? || self.allocated_addresses_by_substate.contains_key(&substate_id) {
+            return Err(match substate_id {
+                SubstateId::Component(address) => RuntimeError::ComponentAlreadyExists { address },
+                address => RuntimeError::SubstateAlreadyExists { address },
+            });
+        }
         let id = self.address_allocation_id;
         self.address_allocation_id = self
             .address_allocation_id
@@ -1350,8 +1357,9 @@ impl<TStore: StateReader> WorkingState<TStore> {
                 details: "address allocation id counter overflowed".to_string(),
             })?;
         let current_template = self.current_template().ok().copied();
+        self.allocated_addresses_by_substate.insert(substate_id.clone(), id);
         self.address_allocations
-            .insert(id, AllocatedAddress::new(address.into(), current_template));
+            .insert(id, AllocatedAddress::new(substate_id, current_template));
         self.current_call_scope_mut()?.add_address_allocation_to_scope(id);
         Ok(id)
     }
@@ -1360,9 +1368,8 @@ impl<TStore: StateReader> WorkingState<TStore> {
     /// checks and hook template lookups may use this.
     pub fn get_allocated_address_by_address<T: Into<SubstateId>>(&self, address: T) -> Option<&AllocatedAddress> {
         let substate_id = address.into();
-        self.address_allocations
-            .values()
-            .find(|alloc| *alloc.substate_id() == substate_id)
+        let id = self.allocated_addresses_by_substate.get(&substate_id)?;
+        self.address_allocations.get(id)
     }
 
     /// Finds a pending allocation for `address` that the current call frame holds. Use this wherever holding the
@@ -1373,11 +1380,13 @@ impl<TStore: StateReader> WorkingState<TStore> {
     ) -> Result<Option<&AllocatedAddress>, RuntimeError> {
         let scope = self.current_call_scope()?;
         let substate_id = address.into();
-        Ok(self
-            .address_allocations
-            .iter()
-            .find(|(id, alloc)| scope.is_address_allocation_in_scope(**id) && *alloc.substate_id() == substate_id)
-            .map(|(_, alloc)| alloc))
+        let Some(&id) = self.allocated_addresses_by_substate.get(&substate_id) else {
+            return Ok(None);
+        };
+        if !scope.is_address_allocation_in_scope(id) {
+            return Ok(None);
+        }
+        Ok(self.address_allocations.get(&id))
     }
 
     pub fn get_template_for_component(
@@ -1399,10 +1408,26 @@ impl<TStore: StateReader> WorkingState<TStore> {
         if !self.current_call_scope()?.is_address_allocation_in_scope(id) {
             return Err(RuntimeError::AddressAllocationNotInScope { id });
         }
+        let current_template = self.current_template().ok().copied();
+        let alloc_addr = self
+            .address_allocations
+            .get(&id)
+            .ok_or(RuntimeError::AddressAllocationNotFound { id })?;
+        if let Some(allocated_template) = alloc_addr.template_address() {
+            let current_template = current_template.ok_or(RuntimeError::NoActiveCallFrame)?;
+            if *allocated_template != current_template {
+                return Err(RuntimeError::AddressAllocationTemplateMismatch {
+                    id,
+                    allocated_by: *allocated_template,
+                    used_by: current_template,
+                });
+            }
+        }
         let alloc_addr = self
             .address_allocations
             .shift_remove(&id)
             .ok_or(RuntimeError::AddressAllocationNotFound { id })?;
+        self.allocated_addresses_by_substate.remove(alloc_addr.substate_id());
         self.current_call_scope_mut()?.remove_address_allocation_from_scope(id);
         self.used_address_allocations
             .insert(id, alloc_addr.substate_id().clone());
@@ -2088,7 +2113,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     /// argument or a return value passes it on, so a frame may name only what it holds: a proof it was shown is
     /// already its caller's. A bucket or allocation this frame lent to a callee stays in its scope after the callee
     /// consumes it, so membership is checked together with liveness.
-    fn check_capabilities_held(&self, value: &IndexedWellKnownTypes) -> Result<(), RuntimeError> {
+    pub(super) fn check_capabilities_held(&self, value: &IndexedWellKnownTypes) -> Result<(), RuntimeError> {
         let scope = self.current_call_scope()?;
         for bucket_id in value.bucket_ids() {
             if !scope.is_bucket_in_scope(*bucket_id) || !self.buckets.contains_key(bucket_id) {
@@ -2097,6 +2122,9 @@ impl<TStore: StateReader> WorkingState<TStore> {
         }
         for proof_id in value.proof_ids() {
             scope.require_held_proof(proof_id)?;
+            if !self.proofs.contains_key(proof_id) {
+                return Err(RuntimeError::ProofNotInScope { proof_id: *proof_id });
+            }
         }
         let allocation_ids = value
             .component_address_allocations()
@@ -2741,47 +2769,172 @@ mod tests {
     fn use_allocated_address_preserves_insertion_order_of_remaining_allocations() {
         let mut state = test_working_state();
         let first_addr = ComponentAddress::from_array([1u8; ObjectKey::LENGTH]);
-        let shared_addr = ComponentAddress::from_array([2u8; ObjectKey::LENGTH]);
-        let template_a = TemplateAddress::from_array([0xAA; 32]);
-        let template_b = TemplateAddress::from_array([0xBB; 32]);
+        let second_addr = ComponentAddress::from_array([2u8; ObjectKey::LENGTH]);
+        let third_addr = ComponentAddress::from_array([3u8; ObjectKey::LENGTH]);
 
         let alloc0 = state.new_address_allocation(first_addr).unwrap();
-
-        let frame_a = PushCallFrame::Static {
-            template_address: template_a,
-            module_name: "A".to_string(),
-            arg_scope: IndexedWellKnownTypes::new(),
-            entity_id: EntityId::default(),
-        }
-        .into_new_call_frame();
-        state.push_frame(frame_a, 10).unwrap();
-        let alloc1 = state.new_address_allocation(shared_addr).unwrap();
-        let ret_a =
-            IndexedWellKnownTypes::from_value(&tari_bor::to_value(&ComponentAddressAllocation::new(alloc1)).unwrap())
-                .unwrap();
-        state.pop_frame(&ret_a).unwrap();
-
-        let frame_b = PushCallFrame::Static {
-            template_address: template_b,
-            module_name: "B".to_string(),
-            arg_scope: IndexedWellKnownTypes::new(),
-            entity_id: EntityId::default(),
-        }
-        .into_new_call_frame();
-        state.push_frame(frame_b, 10).unwrap();
-        let alloc2 = state.new_address_allocation(shared_addr).unwrap();
-        let ret_b =
-            IndexedWellKnownTypes::from_value(&tari_bor::to_value(&ComponentAddressAllocation::new(alloc2)).unwrap())
-                .unwrap();
-        state.pop_frame(&ret_b).unwrap();
+        let alloc1 = state.new_address_allocation(second_addr).unwrap();
+        let alloc2 = state.new_address_allocation(third_addr).unwrap();
 
         state.use_allocated_address(alloc0).unwrap();
 
-        assert_eq!(
-            state
-                .get_allocated_address_by_address(shared_addr)
-                .and_then(|alloc| alloc.template_address()),
-            Some(&template_a)
-        );
+        let remaining_ids: Vec<AddressAllocationId> = state.address_allocations.keys().copied().collect();
+        assert_eq!(remaining_ids, vec![alloc1, alloc2]);
+    }
+
+    fn push_static_frame(
+        state: &mut WorkingState<MemoryStateStore>,
+        template_address: TemplateAddress,
+        arg_scope: IndexedWellKnownTypes,
+    ) {
+        let frame = PushCallFrame::Static {
+            template_address,
+            module_name: "Test".to_string(),
+            arg_scope,
+            entity_id: EntityId::default(),
+        }
+        .into_new_call_frame();
+        state.push_frame(frame, 10).unwrap();
+    }
+
+    #[test]
+    fn use_allocated_address_rejects_template_mismatch_without_consuming_allocation() {
+        let mut state = test_working_state();
+        let template_a = TemplateAddress::from_array([0xAA; 32]);
+        let template_b = TemplateAddress::from_array([0xBB; 32]);
+        let instr_resx_addr = ResourceAddress::new(ObjectKey::from_array([1u8; ObjectKey::LENGTH]));
+        let comp_addr = ComponentAddress::from_array([2u8; ObjectKey::LENGTH]);
+        let resx_addr = ResourceAddress::new(ObjectKey::from_array([3u8; ObjectKey::LENGTH]));
+
+        // Instruction-level allocation outside any frame has `template_address == None`.
+        let instr_alloc_id = state.new_address_allocation(instr_resx_addr).unwrap();
+
+        let instr_arg_scope = IndexedWellKnownTypes::from_value(
+            &tari_bor::to_value(&ResourceAddressAllocation::new(instr_alloc_id)).unwrap(),
+        )
+        .unwrap();
+        push_static_frame(&mut state, template_a, instr_arg_scope);
+
+        let comp_alloc_id = state.new_address_allocation(comp_addr).unwrap();
+        let resx_alloc_id = state.new_address_allocation(resx_addr).unwrap();
+
+        let child_args = IndexedWellKnownTypes::from_value(
+            &tari_bor::to_value(&(
+                ComponentAddressAllocation::new(comp_alloc_id),
+                ResourceAddressAllocation::new(resx_alloc_id),
+                ResourceAddressAllocation::new(instr_alloc_id),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        push_static_frame(&mut state, template_b, child_args);
+
+        assert!(matches!(
+            state.use_allocated_address(comp_alloc_id),
+            Err(RuntimeError::AddressAllocationTemplateMismatch {
+                id,
+                allocated_by,
+                used_by,
+            }) if id == comp_alloc_id && allocated_by == template_a && used_by == template_b
+        ));
+        assert!(matches!(
+            state.use_allocated_address(resx_alloc_id),
+            Err(RuntimeError::AddressAllocationTemplateMismatch {
+                id,
+                allocated_by,
+                used_by,
+            }) if id == resx_alloc_id && allocated_by == template_a && used_by == template_b
+        ));
+
+        // Instruction-allocated address (`template_address == None`) can be consumed by `template_b`.
+        let used_instr = state.use_allocated_address(instr_alloc_id).unwrap();
+        assert_eq!(used_instr.substate_id().as_resource_address(), Some(instr_resx_addr));
+
+        state.pop_frame(&IndexedWellKnownTypes::new()).unwrap();
+
+        // Failed template-mismatch checks in `template_b` left `template_a`'s allocations intact.
+        let used_comp = state.use_allocated_address(comp_alloc_id).unwrap();
+        assert_eq!(used_comp.substate_id().as_component_address(), Some(comp_addr));
+        let used_resx = state.use_allocated_address(resx_alloc_id).unwrap();
+        assert_eq!(used_resx.substate_id().as_resource_address(), Some(resx_addr));
+    }
+
+    #[test]
+    fn new_address_allocation_rejects_existing_or_pending_duplicate_addresses() {
+        let mut state = test_working_state();
+        let comp_addr = ComponentAddress::from_array([4u8; ObjectKey::LENGTH]);
+        let resx_addr = ResourceAddress::new(ObjectKey::from_array([5u8; ObjectKey::LENGTH]));
+
+        let _comp_alloc = state.new_address_allocation(comp_addr).unwrap();
+        assert!(matches!(
+            state.new_address_allocation(comp_addr),
+            Err(RuntimeError::ComponentAlreadyExists { address }) if address == comp_addr
+        ));
+
+        let _resx_alloc = state.new_address_allocation(resx_addr).unwrap();
+        assert!(matches!(
+            state.new_address_allocation(resx_addr),
+            Err(RuntimeError::SubstateAlreadyExists {
+                address: SubstateId::Resource(addr),
+            }) if addr == resx_addr
+        ));
+    }
+
+    #[test]
+    fn check_capabilities_held_rejects_missing_proof_and_consumed_allocations() {
+        let mut state = test_working_state();
+        let template_a = TemplateAddress::from_array([0xAA; 32]);
+        let comp_addr = ComponentAddress::from_array([6u8; ObjectKey::LENGTH]);
+        let resx_addr = ResourceAddress::new(ObjectKey::from_array([7u8; ObjectKey::LENGTH]));
+
+        push_static_frame(&mut state, template_a, IndexedWellKnownTypes::new());
+        let comp_alloc_id = state.new_address_allocation(comp_addr).unwrap();
+        let resx_alloc_id = state.new_address_allocation(resx_addr).unwrap();
+
+        let child_args = IndexedWellKnownTypes::from_value(
+            &tari_bor::to_value(&(
+                ComponentAddressAllocation::new(comp_alloc_id),
+                ResourceAddressAllocation::new(resx_alloc_id),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        push_static_frame(&mut state, template_a, child_args.clone());
+        state.use_allocated_address(comp_alloc_id).unwrap();
+        state.use_allocated_address(resx_alloc_id).unwrap();
+        state.pop_frame(&IndexedWellKnownTypes::new()).unwrap();
+
+        // Parent frame's scope still lists the ids it lent, but the allocations were consumed by the child.
+        let comp_alloc_val = IndexedWellKnownTypes::from_value(
+            &tari_bor::to_value(&ComponentAddressAllocation::new(comp_alloc_id)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.check_capabilities_held(&comp_alloc_val),
+            Err(RuntimeError::AddressAllocationNotInScope { id }) if id == comp_alloc_id
+        ));
+
+        let resx_alloc_val = IndexedWellKnownTypes::from_value(
+            &tari_bor::to_value(&ResourceAddressAllocation::new(resx_alloc_id)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            state.check_capabilities_held(&resx_alloc_val),
+            Err(RuntimeError::AddressAllocationNotInScope { id }) if id == resx_alloc_id
+        ));
+
+        // A proof id present in the frame scope but absent from `state.proofs` is rejected.
+        let dangling_proof_id = ProofId::from(99u32);
+        state
+            .current_call_scope_mut()
+            .unwrap()
+            .add_proof_to_scope(dangling_proof_id);
+        let proof_val =
+            IndexedWellKnownTypes::from_value(&tari_bor::to_value(&Proof::from_id(dangling_proof_id)).unwrap())
+                .unwrap();
+        assert!(matches!(
+            state.check_capabilities_held(&proof_val),
+            Err(RuntimeError::ProofNotInScope { proof_id }) if proof_id == dangling_proof_id
+        ));
     }
 }

@@ -263,8 +263,7 @@ impl CallScope {
     /// boundary: everything the child could reach through a component's state stays behind with that component.
     ///
     /// An allocation is as much a capability as a bucket — [`WorkingState::use_allocated_address`] gates on scope
-    /// membership alone, and nothing checks that the template consuming an allocation is the one that made it — so
-    /// it crosses on the same terms.
+    /// membership and template binding — so it crosses on the same terms.
     pub fn update_from_child_scope(&mut self, child: CallScope, returned: &IndexedWellKnownTypes) {
         self.owned.extend(child.owned.iter().cloned());
         for owned in &child.owned {
