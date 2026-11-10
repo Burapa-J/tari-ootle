@@ -50,7 +50,7 @@ use tari_ootle_wallet_sdk::{
         WriteableWalletStore,
     },
 };
-use tari_template_lib_types::{ResourceAddress, UtxoAddress, UtxoId};
+use tari_template_lib_types::{ComponentAddress, ResourceAddress, UtxoAddress, UtxoId};
 
 use crate::{notify::Notify, utxo_scanner::StealthScannerApiError};
 
@@ -444,9 +444,9 @@ where TSpec: WalletSdkSpec
             let mut spends_unheld = false;
             for spent in self.utxos_to_spend.drain(..) {
                 match Self::spend(tx, self.resource_address, &spent)? {
-                    Spend::Marked => {
+                    Spend::Marked(account_address) => {
                         self.notify.notify(UtxoSpentEvent {
-                            account_address: *self.account.component_address(),
+                            account_address,
                             address: UtxoAddress::new(*self.resource_address, spent.id),
                         });
                         num_spent += 1;
@@ -458,10 +458,10 @@ where TSpec: WalletSdkSpec
 
             for id in self.checked_burns.drain(..) {
                 let address = UtxoAddress::new(*self.resource_address, id);
-                if tx.stealth_outputs_mark_as_burnt(&address)? {
+                if let Some(account_address) = Self::burn(tx, &address)? {
                     info!(target: LOG_TARGET, "🔥 Marked stealth output {} as burnt", address);
                     self.notify.notify(UtxoBurntEvent {
-                        account_address: *self.account.component_address(),
+                        account_address,
                         address,
                     });
                     num_burnt += 1;
@@ -865,12 +865,26 @@ where TSpec: WalletSdkSpec
         }
         tx.stealth_outputs_mark_as_spent(resource_address, &spent.id, spent.version)?;
         info!(target: LOG_TARGET, "Marked stealth output {} as spent", spent.id);
-        Ok(Spend::Marked)
+        Ok(Spend::Marked(output.owner_account))
+    }
+
+    fn burn(
+        tx: &mut <TSpec::Store as WriteableWalletStore>::WriteTransaction<'_>,
+        address: &UtxoAddress,
+    ) -> Result<Option<ComponentAddress>, WalletStorageError> {
+        let Some(output) = tx
+            .stealth_outputs_get_by_commitment(address.resource_address(), &address.id().into_commitment_bytes())
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let marked = tx.stealth_outputs_mark_as_burnt(address)?;
+        Ok(marked.then_some(output.owner_account))
     }
 }
 
 enum Spend {
-    Marked,
+    Marked(ComponentAddress),
     /// The wallet holds the output spent or burnt already, or at a later version.
     Unchanged,
     NotHeld,

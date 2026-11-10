@@ -6,8 +6,11 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use tari_engine_types::{
     component::{Component, ComponentBody, ComponentHeader},
+    non_fungible::NonFungibleContainer,
     resource::Resource,
     resource_container::ResourceContainer,
     substate::{Substate, SubstateDiff, SubstateValue},
@@ -15,14 +18,16 @@ use tari_engine_types::{
 };
 use tari_ootle_common_types::{Epoch, SubstateVersion};
 use tari_ootle_light_client::test_fixtures::ValidatorSetFixture;
-use tari_ootle_transaction::TransactionId;
-use tari_ootle_wallet_sdk::models::{KeyBranch, KeyId};
+use tari_ootle_transaction::{Transaction, TransactionId};
+use tari_ootle_wallet_sdk::models::{KeyBranch, KeyId, NewAccountData, NonFungibleToken, WalletEvent};
 use tari_ootle_wallet_sdk_services::{account_monitor::AccountScanner, notify::Notify};
 use tari_template_builtin::ACCOUNT_TEMPLATE_ADDRESS;
 use tari_template_lib::types::{
     Amount,
     ComponentAddress,
     Metadata,
+    NonFungibleAddress,
+    NonFungibleId,
     ResourceAddress,
     ResourceType,
     SubstateOwnerRule,
@@ -30,7 +35,7 @@ use tari_template_lib::types::{
     access_rules::{ComponentAccessRules, ResourceAccessRules},
 };
 
-use crate::support::{ProvingNetwork, Test, TestSdkSpec, TestWithNetwork};
+use crate::support::{ProvingNetwork, Test, TestSdkSpec, TestWithNetwork, random_key};
 
 const VERSION: SubstateVersion = SubstateVersion::new(3);
 
@@ -152,4 +157,160 @@ async fn a_finalized_account_holding_only_known_vaults_is_not_read_from_the_netw
         .process_result(TransactionId::default(), &diff_with_account(&[held]), None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn process_result_updates_existing_nft_mutable_data_and_filters_by_resource_address() {
+    let nft_vault = vault_id(3);
+    let (_network, test) = wallet_holding(vault_id(1));
+    let nft_resource: ResourceAddress = "resource_1111111111111111111111111111111111111111111111111111111111111111"
+        .parse()
+        .unwrap();
+    let other_nft_resource: ResourceAddress =
+        "resource_2222222222222222222222222222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+
+    test.sdk()
+        .resources_api()
+        .upsert_resource(
+            &nft_resource,
+            &Resource::new(
+                ResourceType::NonFungible,
+                SubstateOwnerRule::None,
+                ResourceAccessRules::new(),
+                Metadata::new(),
+                None,
+                None,
+                0,
+                false,
+            ),
+        )
+        .unwrap();
+    test.sdk()
+        .accounts_api()
+        .add_vault(
+            account_address(),
+            nft_vault,
+            SubstateVersion::ZERO,
+            nft_resource,
+            ResourceType::NonFungible,
+            None,
+            0,
+        )
+        .unwrap();
+
+    let nft_id = NonFungibleId::from_u64(1);
+    test.sdk()
+        .non_fungible_api()
+        .save_nft(&NonFungibleToken {
+            vault_id: nft_vault,
+            nft_id: nft_id.clone(),
+            resource_address: nft_resource,
+            data: tari_bor::Value::Text("immutable".to_string()),
+            mutable_data: tari_bor::Value::Text("before".to_string()),
+            is_burnt: false,
+        })
+        .unwrap();
+
+    let mut diff = SubstateDiff::new();
+    diff.up(account_address().into(), Substate::new(VERSION, account_value(&[nft_vault])));
+    diff.up(
+        nft_vault.into(),
+        Substate::new(
+            VERSION,
+            Vault::new(ResourceContainer::non_fungible(
+                nft_resource,
+                BTreeSet::from([nft_id.clone()]),
+            )),
+        ),
+    );
+    // An unrelated resource's NFT with the same NonFungibleId appears first in the diff.
+    diff.up(
+        NonFungibleAddress::new(other_nft_resource, nft_id.clone()).into(),
+        Substate::new(
+            VERSION,
+            NonFungibleContainer::new(
+                tari_bor::Value::Text("wrong-resource".to_string()),
+                tari_bor::Value::Text("wrong-mutable".to_string()),
+            ),
+        ),
+    );
+    diff.up(
+        NonFungibleAddress::new(nft_resource, nft_id.clone()).into(),
+        Substate::new(
+            VERSION,
+            NonFungibleContainer::new(
+                tari_bor::Value::Text("immutable".to_string()),
+                tari_bor::Value::Text("after".to_string()),
+            ),
+        ),
+    );
+
+    let notify = Notify::new(10);
+    let mut rx = notify.subscribe();
+    AccountScanner::new(notify, test.sdk().clone())
+        .process_result(TransactionId::default(), &diff, None)
+        .await
+        .unwrap();
+
+    let stored = test.sdk().non_fungible_api().get(nft_resource, nft_id).unwrap();
+    assert_eq!(stored.data, tari_bor::Value::Text("immutable".to_string()));
+    assert_eq!(stored.mutable_data, tari_bor::Value::Text("after".to_string()));
+    assert!(matches!(
+        rx.try_recv().expect("expected AccountChangedOnChain event"),
+        WalletEvent::AccountChangedOnChain(event) if event.account_address == account_address()
+    ));
+}
+
+#[tokio::test]
+async fn process_result_recovers_new_account_from_stored_transaction_and_refresh_notifies_once() {
+    let first_vault = vault_id(1);
+    let second_vault = vault_id(2);
+    let (network, test) = wallet_holding(first_vault);
+
+    let tx = Transaction::builder_localnet(Epoch(100)).build_and_seal(&random_key());
+    let tx_id = test
+        .sdk()
+        .transaction_api()
+        .insert_new_transaction(
+            tx,
+            Some(NewAccountData {
+                address: account_address(),
+            }),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
+
+    let notify = Notify::new(10);
+    let mut rx = notify.subscribe();
+    let account_scanner = AccountScanner::new(notify, test.sdk().clone());
+    account_scanner
+        .process_result(tx_id, &diff_with_account(&[first_vault]), None)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        rx.try_recv().expect("expected AccountCreatedOnChain event from stored transaction"),
+        WalletEvent::AccountCreatedOnChain(event) if *event.account.component_address() == account_address()
+    ));
+
+    // Refreshing an account with two updated vaults must emit only one AccountChangedOnChain event.
+    network.serve_substate(
+        account_address().into(),
+        VERSION,
+        account_value(&[first_vault, second_vault]),
+        None,
+    );
+    network.serve_substate(first_vault.into(), VERSION, vault_value(100), None);
+    network.serve_substate(second_vault.into(), VERSION, vault_value(200), None);
+
+    assert!(account_scanner.refresh_account(account_address()).await.unwrap());
+    assert!(matches!(
+        rx.try_recv().expect("expected single AccountChangedOnChain event"),
+        WalletEvent::AccountChangedOnChain(event) if event.account_address == account_address()
+    ));
+    assert!(rx.try_recv().is_err(), "expected no duplicate AccountChangedOnChain event");
 }

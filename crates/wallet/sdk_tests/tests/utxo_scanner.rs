@@ -16,7 +16,20 @@ use tari_indexer_client::types::{EpochCheckpointEntry, ValidatorSetCommittee, Wa
 use tari_ootle_common_types::{StateVersion, SubstateVersion, shard::Shard};
 use tari_ootle_transaction::{Transaction, TransactionEnvelope, TransactionId};
 use tari_ootle_wallet_sdk::{
-    models::{EndOfShard, KeyBranch, KeyId, StartOfShard, UtxoUnspent, UtxoUpdatePayload, WalletUtxoUpdate},
+    models::{
+        EndOfShard,
+        KeyBranch,
+        KeyId,
+        OutputStatus,
+        StartOfShard,
+        StealthOutputModel,
+        UtxoBurnt,
+        UtxoSpent,
+        UtxoUnspent,
+        UtxoUpdatePayload,
+        WalletEvent,
+        WalletUtxoUpdate,
+    },
     network::{
         FetchedSubstates,
         FetchedUtxos,
@@ -31,7 +44,15 @@ use tari_ootle_wallet_sdk::{
 };
 use tari_ootle_wallet_sdk_services::{notify::Notify, utxo_scanner::UtxoScanner};
 use tari_template_abi::TemplateDef;
-use tari_template_lib::types::{ResourceAddress, TemplateAddress, constants::STEALTH_TARI_RESOURCE_ADDRESS};
+use tari_template_lib::types::{
+    EncryptedData,
+    ResourceAddress,
+    TemplateAddress,
+    UtxoId,
+    constants::STEALTH_TARI_RESOURCE_ADDRESS,
+    crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
+    stealth::SpendAuthorization,
+};
 
 use crate::support::{Test, TestWithNetwork, random_keypair};
 
@@ -262,4 +283,111 @@ async fn a_shard_followed_by_another_before_its_end_marker_keeps_its_cursor() {
     assert_eq!(num_queued(&test), 3);
     assert_eq!(saved_cursor(&test, SHARD), None);
     assert_eq!(saved_cursor(&test, other_shard), Some(StateVersion::from(3)));
+}
+
+fn insert_stealth_output(
+    test: &TestWithNetwork<ScriptedUtxoNetwork>,
+    owner_account: tari_template_lib::types::ComponentAddress,
+    commitment_seed: u8,
+) -> UtxoId {
+    let commitment = PedersenCommitmentBytes::from([commitment_seed; 32]);
+    test.sdk()
+        .stealth_outputs_api()
+        .add_output(&StealthOutputModel {
+            owner_account,
+            resource_address: STEALTH_TARI_RESOURCE_ADDRESS,
+            commitment,
+            value: 100,
+            sender_public_nonce: RistrettoPublicKeyBytes::default(),
+            view_only_key_id: KeyId::derived(KeyBranch::ViewOnlyKey, 0),
+            owner_key_id: Some(KeyId::derived(KeyBranch::Account, 0)),
+            encrypted_data: EncryptedData::try_from(vec![0; EncryptedData::min_size()]).unwrap(),
+            tag_byte: UtxoTag::new(0),
+            memo: None,
+            auth: SpendAuthorization::Key(RistrettoPublicKeyBytes::default()),
+            minimum_value_promise: 0,
+            status: OutputStatus::Unspent,
+            is_burnt: false,
+            is_frozen: false,
+            is_on_chain: true,
+            is_condition_spendable: true,
+            lock_id: None,
+            proven_up: None,
+            spent_version: None,
+        })
+        .unwrap();
+    UtxoId::from(commitment)
+}
+
+#[tokio::test]
+async fn spent_and_burnt_utxo_events_name_the_utxo_owner_account_not_the_scanning_account() {
+    let network = ScriptedUtxoNetwork::default();
+    let test = TestWithNetwork::with_network(network.clone());
+    let sdk = test.sdk();
+
+    let second_addr = sdk.key_manager_api().derive_account_address(1).unwrap();
+    let second_account = sdk
+        .accounts_api()
+        .create_account(Some("second"), false, second_addr)
+        .unwrap();
+    let second_component = *second_account.account.component_address();
+
+    // Ensure the scanning account has at least one live output so `unspent_only` is false.
+    let _live_on_first = insert_stealth_output(&test, Test::test_account_address(), 1);
+    let spent_id = insert_stealth_output(&test, second_component, 2);
+    let burnt_id = insert_stealth_output(&test, second_component, 3);
+
+    network.push_stream(vec![
+        UtxoUpdatePayload {
+            sos: Some(StartOfShard {
+                shard: SHARD,
+                max_state_version: StateVersion::from(2),
+                has_more: false,
+                spends_incomplete: false,
+            }),
+            update: Some(WalletUtxoUpdate::Spent(UtxoSpent {
+                id: spent_id,
+                version: SubstateVersion::new(1),
+            })),
+            eos: None,
+        },
+        UtxoUpdatePayload {
+            sos: None,
+            update: Some(WalletUtxoUpdate::Burnt(UtxoBurnt {
+                id: burnt_id,
+                version: SubstateVersion::new(1),
+            })),
+            eos: Some(EndOfShard {
+                max_state_version: StateVersion::from(3),
+            }),
+        },
+    ]);
+
+    let notify = Notify::new(100);
+    let mut rx = notify.subscribe();
+    let first_account = sdk
+        .accounts_api()
+        .get_account_by_address(&Test::test_account_address())
+        .unwrap();
+    UtxoScanner::new(sdk.clone(), notify)
+        .scan_and_enqueue_utxos(&first_account, &STEALTH_TARI_RESOURCE_ADDRESS)
+        .await
+        .unwrap();
+
+    let first_event = rx.try_recv().expect("expected UtxoSpent event");
+    let second_event = rx.try_recv().expect("expected UtxoBurnt event");
+    match first_event {
+        WalletEvent::UtxoSpent(event) => {
+            assert_eq!(event.account_address, second_component);
+            assert_eq!(*event.address.id(), spent_id);
+        },
+        other => panic!("unexpected first event: {other:?}"),
+    }
+    match second_event {
+        WalletEvent::UtxoBurnt(event) => {
+            assert_eq!(event.account_address, second_component);
+            assert_eq!(*event.address.id(), burnt_id);
+        },
+        other => panic!("unexpected second event: {other:?}"),
+    }
 }

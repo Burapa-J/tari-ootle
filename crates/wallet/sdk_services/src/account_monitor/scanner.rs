@@ -198,7 +198,9 @@ where TSpec: WalletSdkSpec
                 continue;
             }
             is_updated = true;
+        }
 
+        if is_updated {
             self.notify.notify(AccountChangedEvent {
                 account_address,
                 version: account_substate_id.version(),
@@ -355,7 +357,7 @@ where TSpec: WalletSdkSpec
                 account_address,
                 latest_vault.get_non_fungible_ids().len()
             );
-            self.update_vault_nfts(vault_id, latest_vault, updated_nft_data).await?;
+            has_changed |= self.update_vault_nfts(vault_id, latest_vault, updated_nft_data).await?;
         }
 
         // If the vault has revealed stealth tokens, we should also to scan for UTXOs
@@ -624,26 +626,43 @@ where TSpec: WalletSdkSpec
                 },
             };
 
-            let maybe_nft_contents = nft.contents();
-
-            let non_fungible = NonFungibleToken {
-                is_burnt: nft.is_burnt(),
-                resource_address: *latest_vault.resource_address(),
-                vault_id,
-                nft_id: id.clone(),
-                data: maybe_nft_contents
-                    .map(|nft| nft.data().clone())
-                    .unwrap_or(tari_bor::Value::Null),
-                mutable_data: maybe_nft_contents
-                    .map(|nft| nft.mutable_data().clone())
-                    .unwrap_or(tari_bor::Value::Null),
-            };
+            let non_fungible = Self::to_stored_nft(&nft, *latest_vault.resource_address(), vault_id, id.clone());
 
             non_fungibles_api.save_nft(&non_fungible)?;
             has_changed = true;
         }
 
+        for (id, nft) in updated_nft_data_cache {
+            if !latest_nft_ids.contains(&id) {
+                continue;
+            }
+            let non_fungible = Self::to_stored_nft(&nft, *latest_vault.resource_address(), vault_id, id);
+            non_fungibles_api.save_nft(&non_fungible)?;
+            has_changed = true;
+        }
+
         Ok(has_changed)
+    }
+
+    fn to_stored_nft(
+        nft: &NonFungibleContainer,
+        resource_address: ResourceAddress,
+        vault_id: VaultId,
+        nft_id: NonFungibleId,
+    ) -> NonFungibleToken {
+        let maybe_nft_contents = nft.contents();
+        NonFungibleToken {
+            is_burnt: nft.is_burnt(),
+            resource_address,
+            vault_id,
+            nft_id,
+            data: maybe_nft_contents
+                .map(|nft| nft.data().clone())
+                .unwrap_or(tari_bor::Value::Null),
+            mutable_data: maybe_nft_contents
+                .map(|nft| nft.mutable_data().clone())
+                .unwrap_or(tari_bor::Value::Null),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -658,6 +677,15 @@ where TSpec: WalletSdkSpec
         let accounts_api = self.wallet_sdk.accounts_api();
 
         let mut new_account = None;
+        let new_account_data = match new_account_data {
+            Some(account) => Some(account),
+            None => self
+                .wallet_sdk
+                .transaction_api()
+                .get(tx_id)
+                .optional()?
+                .and_then(|tx| tx.new_account_info),
+        };
         if let Some(account) = new_account_data {
             let existing_account = accounts_api.get_account_by_address(&account.address).optional()?;
             // Check that the new account was created in this transaction
@@ -762,7 +790,11 @@ where TSpec: WalletSdkSpec
                         .iter()
                         .filter_map(|nft_id| {
                             diff.up_iter()
-                                .find(|(id, _)| id.as_non_fungible_address().map(|a| a.id()) == Some(nft_id))
+                                .find(|(id, _)| {
+                                    id.as_non_fungible_address().is_some_and(|a| {
+                                        *a.resource_address() == *vault.resource_address() && a.id() == nft_id
+                                    })
+                                })
                                 .and_then(|(_, s)| s.substate_value().non_fungible())
                                 .map(|nft| (nft_id.clone(), nft.clone()))
                         })
@@ -840,7 +872,11 @@ where TSpec: WalletSdkSpec
                 .iter()
                 .filter_map(|nft_id| {
                     diff.up_iter()
-                        .find(|(id, _)| id.as_non_fungible_address().map(|a| a.id()) == Some(nft_id))
+                        .find(|(id, _)| {
+                            id.as_non_fungible_address().is_some_and(|a| {
+                                *a.resource_address() == *vault.resource_address() && a.id() == nft_id
+                            })
+                        })
                         .and_then(|(_, s)| s.substate_value().non_fungible())
                         .map(|nft| (nft_id.clone(), nft.clone()))
                 })
