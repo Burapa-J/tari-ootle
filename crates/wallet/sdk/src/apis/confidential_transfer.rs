@@ -5,6 +5,7 @@ use std::{cmp, time::Duration};
 
 use log::*;
 use ootle_byte_type::{FromByteType, ToByteType};
+use ootle_network::Network;
 use tari_bor::{Deserialize, Serialize};
 use tari_crypto::{keys::PublicKey, ristretto::RistrettoPublicKey};
 use tari_engine_types::confidential::MIN_CONFIDENTIAL_OUTPUT_VALUE_PROMISE;
@@ -231,6 +232,9 @@ where TSpec: WalletSdkSpec
         &self,
         params: ConfidentialTransferParams,
     ) -> Result<TransferOutput, ConfidentialTransferApiError> {
+        let network = self.config_api.get_network()?;
+        params.validate(network)?;
+
         let from_account = self.accounts_api.get_account_by_address(&params.from_account)?;
         let to_account = self
             .accounts_api
@@ -432,7 +436,6 @@ where TSpec: WalletSdkSpec
             Amount::zero(),
         )?;
 
-        let network = self.config_api.get_network()?;
         let transaction = Transaction::builder(network.as_byte(), params.max_epoch)
             .with_dry_run(params.is_dry_run)
             // TODO: we assume that from_account has TARI
@@ -567,6 +570,46 @@ pub struct ConfidentialTransferParams {
 }
 
 impl ConfidentialTransferParams {
+    pub fn validate(&self, network: Network) -> Result<(), ConfidentialTransferApiError> {
+        if !self.amount.is_positive() {
+            return Err(ConfidentialTransferApiError::InvalidParameter {
+                param: "amount",
+                reason: "Transfer amount must be greater than zero".to_string(),
+            });
+        }
+        if self.max_fee == 0 {
+            return Err(ConfidentialTransferApiError::InvalidParameter {
+                param: "max_fee",
+                reason: "Max fee must be greater than zero".to_string(),
+            });
+        }
+        if self.destination_address.network() != network {
+            return Err(ConfidentialTransferApiError::InvalidParameter {
+                param: "destination_address",
+                reason: format!(
+                    "Destination address network ({}) does not match wallet network ({})",
+                    self.destination_address.network(),
+                    network
+                ),
+            });
+        }
+        self.destination_address
+            .validate()
+            .map_err(|e| ConfidentialTransferApiError::InvalidParameter {
+                param: "destination_address",
+                reason: format!("Invalid destination address: {e}"),
+            })?;
+        if !self.output_to_revealed && self.confidential_amount().to_u64_checked().is_none() {
+            return Err(ConfidentialTransferApiError::AmountOverflow {
+                param: "confidential_amount",
+                details: "Confidential amount exceeds u64. This is currently a limitation due to the format of \
+                          EncryptedData"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn confidential_amount(&self) -> Amount {
         if self.output_to_revealed {
             Amount::zero()
@@ -581,12 +624,6 @@ impl ConfidentialTransferParams {
         } else {
             Amount::zero()
         }
-    }
-}
-
-impl ConfidentialTransferParams {
-    pub fn total_amount(&self) -> Amount {
-        self.amount + self.max_fee
     }
 }
 
@@ -659,4 +696,60 @@ pub struct ResolvedAccountDetails {
     pub address: ComponentAddress,
     pub vaults: Vec<VaultId>,
     pub exists_on_chain: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use tari_ootle_common_types::crypto::create_key_pair;
+    use tari_template_lib::types::{ComponentAddress, ObjectKey, ResourceAddress};
+
+    use super::{
+        ConfidentialTransferApiError::{AmountOverflow, InvalidParameter},
+        *,
+    };
+
+    fn create_test_transfer_params(network: Network) -> ConfidentialTransferParams {
+        let ((_, view_pk), (_, owner_pk)) = (create_key_pair(), create_key_pair());
+        let destination_address = OotleAddress::new(network, view_pk.to_byte_type(), owner_pk.to_byte_type());
+        ConfidentialTransferParams {
+            from_account: ComponentAddress::new(ObjectKey::default()),
+            input_selection: UtxoInputSelection::PreferRevealed,
+            amount: Amount::from(1_000u64),
+            destination_address,
+            resource_address: ResourceAddress::new(ObjectKey::default()),
+            max_fee: 100,
+            output_to_revealed: false,
+            proof_from_resource: None,
+            memo: None,
+            max_epoch: Epoch(10),
+            is_dry_run: false,
+        }
+    }
+
+    fn check_invalid(p: &ConfidentialTransferParams, net: Network, expected: &str) -> bool {
+        matches!(p.validate(net), Err(InvalidParameter { param, .. }) if param == expected)
+    }
+
+    fn check_overflow(p: &ConfidentialTransferParams, expected: &str) -> bool {
+        matches!(p.validate(Network::LocalNet), Err(AmountOverflow { param, .. }) if param == expected)
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_amount_zero_fee_network_mismatch_and_overflow() {
+        let mut params = create_test_transfer_params(Network::LocalNet);
+        assert!(params.validate(Network::LocalNet).is_ok());
+
+        params.amount = Amount::zero();
+        assert!(check_invalid(&params, Network::LocalNet, "amount"));
+        params.amount = Amount::from(500u64);
+        params.max_fee = 0;
+        assert!(check_invalid(&params, Network::LocalNet, "max_fee"));
+        params.max_fee = 100;
+        assert!(check_invalid(&params, Network::MainNet, "destination_address"));
+        params.amount = Amount::from(u128::from(u64::MAX) + 1);
+        assert!(check_overflow(&params, "confidential_amount"));
+        params.output_to_revealed = true;
+        params.amount = Amount::MAX;
+        assert!(params.validate(Network::LocalNet).is_ok());
+    }
 }

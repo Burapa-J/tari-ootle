@@ -365,3 +365,70 @@ async fn prefer_confidential_respects_locked_revealed_balance() {
         "expected InsufficientFunds, got: {err}"
     );
 }
+
+fn create_test_confidential_transfer_params(
+    destination_address: tari_ootle_address::OotleAddress,
+    resource_address: tari_template_lib::types::ResourceAddress,
+    amount: tari_template_lib::types::Amount,
+) -> ConfidentialTransferParams {
+    ConfidentialTransferParams {
+        from_account: Test::test_account_address(),
+        input_selection: UtxoInputSelection::RevealedOnly,
+        amount,
+        destination_address,
+        resource_address,
+        max_fee: 100,
+        output_to_revealed: false,
+        proof_from_resource: None,
+        memo: None,
+        max_epoch: Epoch(10),
+        is_dry_run: false,
+    }
+}
+
+#[tokio::test]
+async fn confidential_outputs_and_transfer_reject_invalid_parameters_and_overflow_before_locking() {
+    use ConfidentialTransferApiError::{AmountOverflow as TxOverflow, InvalidParameter as TxInvalid};
+    use tari_ootle_wallet_sdk::apis::confidential_outputs::ConfidentialOutputsApiError::InvalidParameter as OutInvalid;
+    use tari_template_lib::types::Amount;
+
+    let test = Test::new();
+    let sdk = test.sdk();
+    let lock_id = test.new_lock().keep_locked();
+    let vault_addr = Test::test_vault_address();
+    let out_api = sdk.confidential_outputs_api();
+
+    let res1 = out_api.lock_outputs_by_amount(lock_id, &vault_addr, 0u64);
+    assert!(matches!(res1, Err(OutInvalid { param: "amount", .. })));
+    let res2 = out_api.lock_outputs_until_partial_amount(lock_id, &vault_addr, Amount::zero());
+    assert!(matches!(res2, Err(OutInvalid { param: "amount", .. })));
+    sdk.locks_api().release_lock(lock_id).unwrap();
+
+    let dest_keys = sdk.key_manager_api().derive_account_address(1).unwrap();
+    let accounts_api = sdk.accounts_api();
+    let dest = accounts_api.create_account(Some("dest"), false, dest_keys).unwrap();
+    let conf_resource = add_revealed_confidential_vault(&test);
+    let conf_vault: VaultId = "vault_0000000000000000000000000000000000000000000000000000000000000c0f"
+        .parse()
+        .unwrap();
+    let huge_balance = Amount::from(u128::from(u64::MAX) + 10_000);
+    let v1 = SubstateVersion::from(1u64);
+    accounts_api
+        .update_vault_balance_and_record_change(conf_vault, v1, huge_balance, Amount::zero(), BalanceChangeSource::Scan)
+        .unwrap();
+    let key_before = sdk.key_manager_api().next_key(KeyBranch::ConfidentialMask).unwrap();
+
+    let tx_api = sdk.confidential_transfer_api();
+    let zero_params = create_test_confidential_transfer_params(dest.address().clone(), conf_resource, Amount::zero());
+    let res3 = tx_api.transfer(zero_params).await;
+    assert!(matches!(res3, Err(TxInvalid { param: "amount", .. })));
+    let max_plus_1 = Amount::from(u128::from(u64::MAX) + 1);
+    let over_params = create_test_confidential_transfer_params(dest.address().clone(), conf_resource, max_plus_1);
+    let res4 = tx_api.transfer(over_params).await;
+    assert!(matches!(res4, Err(TxOverflow { param, .. }) if param == "confidential_amount"));
+
+    let vault = accounts_api.get_vault(&conf_vault).unwrap();
+    assert_eq!(vault.locked_revealed_balance, Amount::zero());
+    let key_after = sdk.key_manager_api().next_key(KeyBranch::ConfidentialMask).unwrap();
+    assert_eq!(key_after.derived_key_id.index, key_before.derived_key_id.index + 1);
+}

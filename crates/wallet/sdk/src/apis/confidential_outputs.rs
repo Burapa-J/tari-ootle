@@ -56,7 +56,7 @@ where TSpec: WalletSdkSpec
         vault_id: &VaultId,
         amount: A,
     ) -> Result<(Vec<ConfidentialOutputModel>, Amount), ConfidentialOutputsApiError> {
-        let amount = amount.into();
+        let amount = validate_lock_amount(amount.into())?;
         self.store.with_write_tx(|tx| {
             let (outputs, total_output_amount) = self.lock_outputs_internal(tx, lock_id, vault_id, amount)?;
 
@@ -74,6 +74,7 @@ where TSpec: WalletSdkSpec
         vault_id: &VaultId,
         amount: Amount,
     ) -> Result<(Vec<ConfidentialOutputModel>, Amount), ConfidentialOutputsApiError> {
+        let amount = validate_lock_amount(amount)?;
         self.store
             .with_write_tx(|tx| self.lock_outputs_internal(tx, locked_id, vault_id, amount))
     }
@@ -307,5 +308,29 @@ impl IsNotFoundError for ConfidentialOutputsApiError {
         matches!(self, Self::StoreError(e) if e.is_not_found_error()) ||
             matches!(self, Self::KeyManager(e) if e.is_not_found_error()) ||
             matches!(self, Self::Accounts(e) if e.is_not_found_error())
+    }
+}
+
+fn validate_lock_amount(amount: Amount) -> Result<Amount, ConfidentialOutputsApiError> {
+    if !amount.is_positive() {
+        return Err(ConfidentialOutputsApiError::InvalidParameter {
+            param: "amount",
+            reason: "Amount to lock must be greater than zero".to_string(),
+        });
+    }
+    Ok(amount)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_lock_amount_rejects_zero_and_accepts_positive() {
+        assert!(matches!(
+            validate_lock_amount(Amount::zero()),
+            Err(ConfidentialOutputsApiError::InvalidParameter { param: "amount", .. })
+        ));
+        assert_eq!(validate_lock_amount(Amount::from(50u64)).unwrap(), Amount::from(50u64));
     }
 }

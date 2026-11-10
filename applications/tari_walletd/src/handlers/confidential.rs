@@ -79,6 +79,18 @@ pub async fn handle_create_transfer_proof(
     account
         .owner_key_id()
         .ok_or_else(|| invalid_request("Account does not have an owner key"))?;
+    let amount_to_transfer = req.confidential_amount.checked_add(req.reveal_amount).ok_or_else(|| {
+        invalid_request(format!(
+            "Amount to send must be greater than or equal to the amount to reveal. Amount = {}, Revealed = {}",
+            req.confidential_amount, req.reveal_amount
+        ))
+    })?;
+    if !amount_to_transfer.is_positive() {
+        return Err(invalid_params(
+            "amount",
+            Some("Amount to transfer must be greater than zero"),
+        ));
+    }
     let vault = sdk
         .accounts_api()
         .get_vault_by_resource(account.component_address(), &req.resource_address)?;
@@ -86,12 +98,6 @@ pub async fn handle_create_transfer_proof(
         .locks_api()
         .create_owned_lock_with_timeout(Duration::from_secs(5 * 60), auth.lock_owner())?;
 
-    let amount_to_transfer = req.confidential_amount.checked_add(req.reveal_amount).ok_or_else(|| {
-        invalid_request(format!(
-            "Amount to send must be greater than or equal to the amount to reveal. Amount = {}, Revealed = {}",
-            req.confidential_amount, req.reveal_amount
-        ))
-    })?;
     // Lock inputs we're going to spend
     let (inputs, total_input_value) =
         sdk.confidential_outputs_api()
@@ -603,5 +609,46 @@ mod tests {
             .unwrap();
         assert_eq!(decrypted.value(), 1_000);
         assert_eq!(decrypted.memo, Some(memo));
+    }
+
+    #[tokio::test]
+    async fn create_transfer_proof_rejects_zero_amount_before_creating_lock() {
+        let daemon = TestDaemon::start().await;
+        let sdk = daemon.context.wallet_sdk();
+        let owner_key = sdk.key_manager_api().next_key(KeyBranch::Account).unwrap();
+        let view_key = sdk.key_manager_api().next_key(KeyBranch::ViewOnlyKey).unwrap();
+        let account_address = "component_0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        sdk.accounts_api()
+            .add_account(
+                Some("default"),
+                &account_address,
+                view_key.as_key_id(),
+                owner_key.as_key_id(),
+                Epoch(0),
+                false,
+                true,
+            )
+            .unwrap();
+        let resource_address = "resource_0000000000000000000000000000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
+        let err = handle_create_transfer_proof(&daemon.context, Some(&daemon.session), ProofsGenerateRequest {
+            account: None,
+            reveal_amount: Amount::zero(),
+            resource_address,
+            destination_address: OotleAddress::new(
+                Network::LocalNet,
+                view_key.to_public_key().to_byte_type(),
+                owner_key.to_public_key().to_byte_type(),
+            ),
+            confidential_amount: Amount::zero(),
+            output_memo: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("amount"), "{err}");
+        assert!(!lock_exists(&daemon, 1));
     }
 }
